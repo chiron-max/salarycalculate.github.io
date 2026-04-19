@@ -1100,10 +1100,10 @@ const STORAGE_KEY = "monthly-work-hours-v1";
 const BUILTIN_IDS = ["day-shift","night-shift","half-day","overtime","custom"];
 
 const DEFAULT_PROFILES = [
-  { id:"day-shift",   name:"白班 09:00-17:00",  expectedMinutes:480, nightStart:1320, nightEnd:360, presetStart:"09:00", presetEnd:"17:00", defaultType:"normal"   },
-  { id:"night-shift", name:"夜班 20:00-08:00",  expectedMinutes:720, nightStart:1320, nightEnd:360, presetStart:"20:00", presetEnd:"08:00", defaultType:"night"    },
-  { id:"half-day",    name:"半天班 09:00-13:00", expectedMinutes:240, nightStart:1320, nightEnd:360, presetStart:"09:00", presetEnd:"13:00", defaultType:"normal"   },
-  { id:"overtime",    name:"加班 18:00-22:00",  expectedMinutes:240, nightStart:1320, nightEnd:360, presetStart:"18:00", presetEnd:"22:00", defaultType:"overtime" },
+  { id:"day-shift",   name:"白班",  expectedMinutes:480, nightStart:1320, nightEnd:360, presetStart:"09:00", presetEnd:"17:00", defaultType:"normal"   },
+  { id:"night-shift", name:"夜班",  expectedMinutes:720, nightStart:1320, nightEnd:360, presetStart:"20:00", presetEnd:"08:00", defaultType:"night"    },
+  { id:"half-day",    name:"半天班", expectedMinutes:240, nightStart:1320, nightEnd:360, presetStart:"09:00", presetEnd:"13:00", defaultType:"normal"   },
+  { id:"overtime",    name:"加班",  expectedMinutes:240, nightStart:1320, nightEnd:360, presetStart:"18:00", presetEnd:"22:00", defaultType:"overtime" },
   { id:"custom",      name:"自定义",             expectedMinutes:0,   nightStart:1320, nightEnd:360, presetStart:"09:00", presetEnd:"18:00", defaultType:"custom"   }
 ];
 
