@@ -1792,6 +1792,126 @@ function checkSegmentConflict(segments, segId) {
   return segments.some(s => s.id !== segId && checkTimeConflict(target, s));
 }
 
+
+function dateKeyToLocalDate(dateKey) {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function addDaysToDateKey(dateKey, days) {
+  const date = dateKeyToLocalDate(dateKey);
+  date.setDate(date.getDate() + days);
+  return toDateKey(date);
+}
+
+function diffDays(dateKeyA, dateKeyB) {
+  const a = dateKeyToLocalDate(dateKeyA);
+  const b = dateKeyToLocalDate(dateKeyB);
+  return Math.round((b - a) / 86400000);
+}
+
+function normalizeLogicalEnd(startMinute, endMinute) {
+  return endMinute <= startMinute ? endMinute + 1440 : endMinute;
+}
+
+function buildStoredSegmentsByDate(targetDates, segmentInput) {
+  const grouped = new Map();
+
+  for (const dateKey of targetDates) {
+    const logicalEnd = normalizeLogicalEnd(segmentInput.startMinute, segmentInput.endMinute);
+    const groupId = cryptoId();
+    const totalSpanParts = Math.max(1, Math.ceil((logicalEnd - segmentInput.startMinute) / 1440));
+
+    let cursor = segmentInput.startMinute;
+    let spanIndex = 0;
+
+    while (cursor < logicalEnd) {
+      const dayOffset = Math.floor(cursor / 1440);
+      const nextBoundary = (dayOffset + 1) * 1440;
+      const partAbsEnd = Math.min(logicalEnd, nextBoundary);
+
+      const partStart = cursor % 1440;
+      const partEnd = partAbsEnd % 1440 === 0 ? 1440 : partAbsEnd % 1440;
+
+      const storeDateKey = addDaysToDateKey(dateKey, dayOffset);
+      const payload = {
+        id: cryptoId(),
+        profileId: segmentInput.profileId,
+        segmentType: segmentInput.segmentType,
+        startMinute: partStart,
+        endMinute: partEnd,
+        note: segmentInput.note || "",
+        groupId,
+        spanIndex,
+        spanTotal: totalSpanParts,
+        createdAt: new Date().toISOString()
+      };
+
+      if (!grouped.has(storeDateKey)) grouped.set(storeDateKey, []);
+      grouped.get(storeDateKey).push(payload);
+
+      cursor = partAbsEnd;
+      spanIndex += 1;
+    }
+  }
+
+  return grouped;
+}
+
+function findSegmentByDateAndId(dateKey, segmentId) {
+  const month = getMonthData(monthKeyFromDateKey(dateKey));
+  const day = month.days[dateKey];
+  if (!day) return null;
+  const segment = (day.segments || []).find(s => s.id === segmentId);
+  if (!segment) return null;
+  return { monthKey: month.month, dateKey, day, segment };
+}
+
+function findSegmentsByGroupId(groupId) {
+  if (!groupId) return [];
+  const result = [];
+  for (const [monthKey, month] of Object.entries(state.data.months || {})) {
+    for (const [dateKey, day] of Object.entries(month.days || {})) {
+      for (const segment of day.segments || []) {
+        if (segment.groupId === groupId) {
+          result.push({ monthKey, dateKey, day, segment });
+        }
+      }
+    }
+  }
+  result.sort((a, b) => {
+    const byDate = a.dateKey.localeCompare(b.dateKey);
+    if (byDate !== 0) return byDate;
+    return (a.segment.spanIndex || 0) - (b.segment.spanIndex || 0);
+  });
+  return result;
+}
+
+function getEditableSegmentIds() {
+  if (!state.editing) return [];
+  const target = findSegmentByDateAndId(state.editing.dateKey, state.editing.segmentId);
+  if (!target) return [state.editing.segmentId];
+  const { segment } = target;
+  if (!segment.groupId) return [segment.id];
+  return findSegmentsByGroupId(segment.groupId).map(item => item.segment.id);
+}
+
+function removeLinkedSegmentsByEditingTarget() {
+  if (!state.editing) return;
+  const target = findSegmentByDateAndId(state.editing.dateKey, state.editing.segmentId);
+  if (!target) return;
+
+  const { segment } = target;
+  if (segment.groupId) {
+    for (const item of findSegmentsByGroupId(segment.groupId)) {
+      item.day.segments = item.day.segments.filter(s => s.groupId !== segment.groupId);
+    }
+  } else {
+    target.day.segments = target.day.segments.filter(s => s.id !== segment.id);
+  }
+  saveData(state.data);
+}
+
 /* ─── WEEKEND DETECTION ────────────────────────── */
 
 function isWeekendDay(dateKey) {
@@ -1801,6 +1921,7 @@ function isWeekendDay(dateKey) {
 }
 
 /* ─── SEGMENT FORM ─────────────────────────────── */
+
 
 function handleFormSubmit(e) {
   e.preventDefault();
@@ -1816,32 +1937,53 @@ function handleFormSubmit(e) {
 
   if (isNaN(startMinute) || isNaN(endMinute)) { showToast("开始时间或结束时间无效"); return; }
   if (startMinute === endMinute) { showToast("开始与结束不能相同"); return; }
-  if (endMinute <= startMinute) endMinute += 1440;
 
   const targetDates = resolveTargetDates();
   if (!targetDates.length) { showToast("没有可应用的日期"); return; }
 
+  const editingIds = getEditableSegmentIds();
+  const editingGroupId = state.editing?.groupId || null;
+  const plannedByDate = buildStoredSegmentsByDate(targetDates, {
+    profileId,
+    segmentType,
+    startMinute,
+    endMinute,
+    note
+  });
+
   let conflictFound = false;
-  for (const dk of targetDates) {
-    const m = getMonthData(monthKeyFromDateKey(dk));
-    const dayData = m.days[dk] || { segments:[] };
-    const newSeg = { id: state.editing ? state.editing.segmentId : cryptoId(), profileId, segmentType, startMinute, endMinute, note };
-    const toCheck = state.editing && dk === state.editing.dateKey
-      ? dayData.segments.filter(s => s.id !== state.editing.segmentId)
-      : dayData.segments;
-    for (const es of toCheck) if (checkTimeConflict(newSeg, es)) { conflictFound = true; break; }
+  for (const [dateKey, plannedSegments] of plannedByDate.entries()) {
+    const m = getMonthData(monthKeyFromDateKey(dateKey));
+    const dayData = m.days[dateKey] || { segments:[] };
+    const toCheck = (dayData.segments || []).filter(s =>
+      !editingIds.includes(s.id) && (!editingGroupId || s.groupId !== editingGroupId)
+    );
+
+    for (const planned of plannedSegments) {
+      for (const existing of toCheck) {
+        if (checkTimeConflict(planned, existing)) {
+          conflictFound = true;
+          break;
+        }
+      }
+      if (conflictFound) break;
+    }
     if (conflictFound) break;
   }
 
   if (conflictFound && !confirm("检测到时间冲突！是否继续添加？")) return;
 
   if (state.editing) {
-    const { dateKey, segmentId } = state.editing;
-    updateSegment(dateKey, segmentId, { profileId, segmentType, startMinute, endMinute, note });
+    removeLinkedSegmentsByEditingTarget();
+    for (const [dateKey, plannedSegments] of plannedByDate.entries()) {
+      for (const seg of plannedSegments) addSegment(dateKey, seg);
+    }
     state.editing = null;
     showToast("已保存修改");
   } else {
-    targetDates.forEach(dk => addSegment(dk, { profileId, segmentType, startMinute, endMinute, note }));
+    for (const [dateKey, plannedSegments] of plannedByDate.entries()) {
+      for (const seg of plannedSegments) addSegment(dateKey, seg);
+    }
     showToast(targetDates.length > 1 ? `已批量添加到 ${targetDates.length} 天` : "已添加");
   }
 
@@ -1849,26 +1991,49 @@ function handleFormSubmit(e) {
   render();
 }
 
+
 function resolveTargetDates() {
   if (state.editing) return [state.editing.dateKey];
   if (state.multiSelectMode && state.selectedDates.size) return [...state.selectedDates].sort();
   return state.selectedDate ? [state.selectedDate] : [];
 }
 
+
 function startEdit(dateKey, segmentId) {
-  const month = getMonthData(monthKeyFromDateKey(dateKey));
-  const seg = (month.days[dateKey]?.segments || []).find(s => s.id === segmentId);
-  if (!seg) return;
+  const target = findSegmentByDateAndId(dateKey, segmentId);
+  if (!target) return;
+
+  const { segment } = target;
   state.selectedDate = dateKey;
   state.selectedDates.clear();
   state.multiSelectMode = false;
-  state.editing = { dateKey, segmentId };
+
+  let startMinute = segment.startMinute;
+  let endMinute = segment.endMinute;
+
+  if (segment.groupId) {
+    const linked = findSegmentsByGroupId(segment.groupId);
+    if (linked.length) {
+      const first = linked[0];
+      const last = linked[linked.length - 1];
+      startMinute = first.segment.startMinute;
+      const dayOffset = diffDays(first.dateKey, last.dateKey);
+      endMinute = dayOffset * 1440 + last.segment.endMinute;
+    }
+  }
+
+  state.editing = {
+    dateKey,
+    segmentId,
+    groupId: segment.groupId || null
+  };
+
   els.segmentForm.elements.segmentId.value = segmentId;
-  els.segmentForm.elements.profileId.value = seg.profileId;
-  els.segmentForm.elements.start.value = minuteToTime(seg.startMinute);
-  els.segmentForm.elements.end.value = minuteToTime(seg.endMinute % 1440);
-  els.segmentForm.elements.segmentType.value = seg.segmentType || "custom";
-  els.segmentForm.elements.note.value = seg.note || "";
+  els.segmentForm.elements.profileId.value = segment.profileId;
+  els.segmentForm.elements.start.value = minuteToTime(startMinute);
+  els.segmentForm.elements.end.value = minuteToTime(endMinute % 1440);
+  els.segmentForm.elements.segmentType.value = segment.segmentType || "custom";
+  els.segmentForm.elements.note.value = segment.note || "";
   updateMultiSelectButton();
   render();
   showToast("已进入编辑状态");
@@ -1888,10 +2053,16 @@ function syncFormDefaults() {
 
 /* ─── DATA OPS ─────────────────────────────────── */
 
+
 function addSegment(dateKey, segment) {
   const month = getMonthData(monthKeyFromDateKey(dateKey));
   ensureDay(month.month, dateKey);
-  month.days[dateKey].segments.push({ id:cryptoId(), ...segment, note:segment.note||"", createdAt:new Date().toISOString() });
+  month.days[dateKey].segments.push({
+    id: segment.id || cryptoId(),
+    ...segment,
+    note: segment.note || "",
+    createdAt: segment.createdAt || new Date().toISOString()
+  });
   saveData(state.data);
 }
 
@@ -1906,14 +2077,26 @@ function updateSegment(dateKey, segmentId, updates) {
 }
 
 function deleteSegment(dateKey, segmentId) {
-  const month = getMonthData(monthKeyFromDateKey(dateKey));
-  const day = month.days[dateKey];
-  if (!day) return;
-  day.segments = day.segments.filter(s => s.id !== segmentId);
-  if (state.editing && state.editing.dateKey === dateKey && state.editing.segmentId === segmentId) {
-    state.editing = null;
-    syncFormDefaults();
+  const target = findSegmentByDateAndId(dateKey, segmentId);
+  if (!target) return;
+
+  const { segment } = target;
+  if (segment.groupId) {
+    for (const item of findSegmentsByGroupId(segment.groupId)) {
+      item.day.segments = item.day.segments.filter(s => s.groupId !== segment.groupId);
+    }
+  } else {
+    target.day.segments = target.day.segments.filter(s => s.id !== segment.id);
   }
+
+  if (state.editing) {
+    const editingTarget = findSegmentByDateAndId(state.editing.dateKey, state.editing.segmentId);
+    if (!editingTarget || (editingTarget.segment.groupId ? editingTarget.segment.groupId === segment.groupId : editingTarget.segment.id === segment.id)) {
+      state.editing = null;
+      syncFormDefaults();
+    }
+  }
+
   saveData(state.data);
   render();
 }
@@ -1933,29 +2116,74 @@ function computeMonthStats(monthKey) {
       const expected = Math.max(0, profile.expectedMinutes || 0);
       normalMinutes   += Math.min(dur, expected);
       overtimeMinutes += Math.max(dur - expected, 0);
-      nightMinutes    += computeNightOverlap(seg.startMinute, seg.endMinute, profile.nightStart, profile.nightEnd);
+      
+      // 修复夜班时间计算逻辑
+      nightMinutes += computeNightOverlap(seg.startMinute, seg.endMinute, profile.nightStart, profile.nightEnd);
     }
   }
   return { totalMinutes, normalMinutes, overtimeMinutes, nightMinutes, workingDays, dayCount };
 }
 
+// 修复夜班时间计算逻辑，使其正确处理跨天情况
 function computeNightOverlap(start, end, nightStart=1320, nightEnd=360) {
   let total = 0;
-  const firstBase = Math.floor(start/1440)*1440 - 1440;
-  const lastBase  = Math.floor(end/1440)*1440   + 1440;
-  for (let base=firstBase; base<=lastBase; base+=1440) {
+  
+  // 如果结束时间大于1440分钟（即跨天），需要分别计算当天和第二天的夜班时间
+  if (end > 1440) {
+    // 计算当天的夜班时间（从开始时间到24:00）
+    const dayStart = start;
+    const dayEnd = 1440;
     if (nightStart < nightEnd) {
-      total += overlap(start, end, base+nightStart, base+nightEnd);
+      // 夜班窗口在同一天内（例如 22:00 到 23:00）
+      total += overlap(dayStart, dayEnd, nightStart, nightEnd);
     } else {
-      total += overlap(start, end, base+nightStart, base+1440);
-      total += overlap(start, end, base, base+nightEnd);
+      // 夜班窗口跨天（例如 22:00 到 06:00）
+      total += overlap(dayStart, dayEnd, nightStart, 1440);
+    }
+    
+    // 计算第二天的夜班时间（从00:00到结束时间-1440）
+    const nextDayStart = 0;
+    const nextDayEnd = end - 1440;
+    if (nightStart < nightEnd) {
+      // 夜班窗口在同一天内（例如 22:00 到 23:00）
+      total += overlap(nextDayStart, nextDayEnd, nightStart, nightEnd);
+    } else {
+      // 夜班窗口跨天（例如 00:00 到 06:00）
+      if (nightStart > 1440) {
+        // 如果夜班开始时间也跨天，需要调整为第二天的时间
+        total += overlap(nextDayStart, nextDayEnd, nightStart - 1440, 1440);
+      } else {
+        total += overlap(nextDayStart, nextDayEnd, 0, nightEnd);
+      }
+    }
+  } else {
+    // 不跨天的情况
+    if (nightStart < nightEnd) {
+      total += overlap(start, end, nightStart, nightEnd);
+    } else {
+      // 夜班窗口跨天（例如 22:00 到 06:00）
+      total += overlap(start, end, nightStart, 1440);
+      total += overlap(start, end, 0, nightEnd);
     }
   }
+  
   return total;
 }
 
-function overlap(aS,aE,bS,bE) { return Math.max(0, Math.min(aE,bE) - Math.max(aS,bS)); }
-function getSegmentDuration(seg) { return Math.max(0, seg.endMinute - seg.startMinute); }
+function overlap(aS,aE,bS,bE) { 
+  // 正确计算时间重叠
+  const actualStart = Math.max(aS, bS);
+  const actualEnd = Math.min(aE, bE);
+  return Math.max(0, actualEnd - actualStart);
+}
+
+function getSegmentDuration(seg) { 
+  // 修复持续时间计算，考虑跨天情况
+  if (seg.endMinute > 1440) {
+    return seg.endMinute - seg.startMinute - 1440; // 减去24小时的重复计算
+  }
+  return Math.max(0, seg.endMinute - seg.startMinute); 
+}
 
 /* ─── TIMELINE PIECES ──────────────────────────── */
 
@@ -2163,7 +2391,10 @@ function minuteToTime(minute) {
 }
 
 function formatRange(s,e) {
-  return e>1440 ? `${minuteToTime(s)} → 次日${minuteToTime(e)}` : `${minuteToTime(s)} → ${minuteToTime(e)}`;
+  if (e > 1440) {
+    return `${minuteToTime(s)} → 次日${minuteToTime(e - 1440)}`;
+  }
+  return `${minuteToTime(s)} → ${minuteToTime(e)}`;
 }
 
 function formatHours(minutes) {
